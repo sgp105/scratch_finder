@@ -21,26 +21,31 @@ class ScoreParams:
     p_B: float = 0.95
     p_G: float = 0.20
     alpha_B: float = 0.7
-    alpha_G: float = 0.3
-    k_N: float = 8.0
+    alpha_G: float = 0.4
+    k_N: float = 5.0
+    virtual_good_h: int = 3
     eps: float = 1e-12
 
 
 DISPLAY_COLUMNS = [
-    "process_id",
-    "N",
-    "n_B",
-    "n_G",
-    "m",
+    "step_seq",
+    "N_real",
+    "n_B_real",
+    "n_G_real",
+    "m_real",
+    "N_eff",
+    "B_eff",
+    "m_eff",
+    "virtual_good_h",
     "n_B1",
     "n_B0",
     "n_G1",
     "n_G0",
     "mean_likelihood",
-    "quality",
-    "p_tail",
-    "evidence",
-    "r_N",
+    "quality_real",
+    "p_tail_eff",
+    "evidence_eff",
+    "r_real",
     "score",
     "score_exact_alt",
 ]
@@ -74,8 +79,8 @@ def hypergeom_tail_pvalue(N: int, n_B: int, m: int, x_obs: int) -> float:
     """
     Compute P(X >= x_obs), X ~ Hypergeometric(N, n_B, m).
 
-    Degenerate / no-contrast cases return 1.0 so evidence becomes zero:
-    no wafers, no Bad class, no Good class, no y=1 wafer, or all wafers y=1.
+    Degenerate cases return 1.0 so evidence becomes zero. Good-class contrast
+    may be supplied by an upstream virtual-good prior before calling this function.
     """
     N = int(N)
     n_B = int(n_B)
@@ -83,7 +88,7 @@ def hypergeom_tail_pvalue(N: int, n_B: int, m: int, x_obs: int) -> float:
     x_obs = int(x_obs)
     n_G = N - n_B
 
-    if N <= 0 or n_B <= 0 or n_G <= 0 or m <= 0 or m >= N:
+    if N <= 0 or n_B <= 0 or n_G < 0 or m <= 0 or m >= N:
         return 1.0
     if not (0 <= n_B <= N and 0 <= m <= N):
         raise ValueError(f"Invalid hypergeometric parameters: N={N}, n_B={n_B}, m={m}")
@@ -115,6 +120,13 @@ def _validate_counts(*counts: int) -> None:
             raise ValueError(f"Counts must be non-negative integers: {counts}")
 
 
+def _validate_params(params: ScoreParams) -> None:
+    if int(params.virtual_good_h) != params.virtual_good_h or params.virtual_good_h < 0:
+        raise ValueError(f"virtual_good_h must be a non-negative integer: {params.virtual_good_h}")
+    if params.k_N < 0:
+        raise ValueError(f"k_N must be non-negative: {params.k_N}")
+
+
 def score_process_counts(
     n_B1: int,
     n_B0: int,
@@ -122,8 +134,9 @@ def score_process_counts(
     n_G0: int,
     params: Optional[ScoreParams] = None,
 ) -> Dict[str, float]:
-    """Score one process from its 2x2 state/context count table."""
+    """Score one process step from its 2x2 good_bad/context count table."""
     params = params or ScoreParams()
+    _validate_params(params)
     _validate_counts(n_B1, n_B0, n_G1, n_G0)
 
     n_B1 = int(n_B1)
@@ -133,20 +146,30 @@ def score_process_counts(
 
     p_B = _safe_prob(params.p_B, params.eps)
     p_G = _safe_prob(params.p_G, params.eps)
+    virtual_good_h = int(params.virtual_good_h)
 
-    n_B = n_B1 + n_B0
-    n_G = n_G1 + n_G0
-    N = n_B + n_G
-    m = n_B1 + n_G1
+    n_B_real = n_B1 + n_B0
+    n_G_real = n_G1 + n_G0
+    N_real = n_B_real + n_G_real
+    m_real = n_B1 + n_G1
+
+    n_B1_eff = n_B1
+    n_B0_eff = n_B0
+    n_G1_eff = n_G1
+    n_G0_eff = n_G0 + virtual_good_h
+    N_eff = n_B1_eff + n_B0_eff + n_G1_eff + n_G0_eff
+    B_eff = n_B1_eff + n_B0_eff
+    m_eff = n_B1_eff + n_G1_eff
+    x_obs = n_B1_eff
 
     w_B0 = math.log(p_B / (1.0 - p_B))
     w_G1 = math.log((1.0 - p_G) / p_G)
 
-    if N == 0:
+    if N_real == 0:
         log_likelihood = 0.0
         mean_likelihood = 0.0
         ideal_log_likelihood = 0.0
-        r_N = 0.0
+        r_real = 0.0
     else:
         log_likelihood = (
             n_B1 * math.log(p_B)
@@ -154,45 +177,63 @@ def score_process_counts(
             + n_G1 * math.log(p_G)
             + n_G0 * math.log(1.0 - p_G)
         )
-        mean_likelihood = math.exp(log_likelihood / N)
-        ideal_log_likelihood = n_B * math.log(p_B) + n_G * math.log(1.0 - p_G)
-        r_N = N / (N + params.k_N)
+        mean_likelihood = math.exp(log_likelihood / N_real)
+        ideal_log_likelihood = n_B_real * math.log(p_B) + n_G_real * math.log(1.0 - p_G)
+        r_real = N_real / (N_real + params.k_N) if (N_real + params.k_N) > 0 else 0.0
 
     penalty_raw = n_B0 * w_B0 + n_G1 * w_G1
-    bad_miss_rate = n_B0 / n_B if n_B > 0 else 0.0
-    good_false_context_rate = n_G1 / n_G if n_G > 0 else 0.0
-    J_bal = (
-        params.alpha_B * w_B0 * bad_miss_rate
-        + params.alpha_G * w_G1 * good_false_context_rate
-    )
-    quality = math.exp(-J_bal)
+    bad_miss_rate = n_B0 / n_B_real if n_B_real > 0 else 0.0
+    good_false_context_rate = n_G1 / n_G_real if n_G_real > 0 else 0.0
+    if n_B_real == 0:
+        J_bal = 0.0
+    elif n_G_real > 0:
+        J_bal = (
+            params.alpha_B * w_B0 * bad_miss_rate
+            + params.alpha_G * w_G1 * good_false_context_rate
+        )
+    else:
+        J_bal = params.alpha_B * w_B0 * bad_miss_rate
+    quality_real = math.exp(-J_bal)
 
-    p_tail = hypergeom_tail_pvalue(N=N, n_B=n_B, m=m, x_obs=n_B1)
-    evidence = 0.0 if p_tail >= 1.0 else -math.log(max(p_tail, params.eps))
-    score = r_N * quality * evidence
+    p_tail_eff = hypergeom_tail_pvalue(N=N_eff, n_B=B_eff, m=m_eff, x_obs=x_obs)
+    evidence_eff = 0.0 if p_tail_eff >= 1.0 else -math.log(max(p_tail_eff, params.eps))
+    score = 0.0 if n_B_real == 0 else r_real * quality_real * evidence_eff
 
     log_count_prob_alt = (
-        log_comb(n_B, n_B1)
+        log_comb(n_B_real, n_B1)
         + n_B1 * math.log(p_B)
         + n_B0 * math.log(1.0 - p_B)
-        + log_comb(n_G, n_G1)
+        + log_comb(n_G_real, n_G1)
         + n_G1 * math.log(p_G)
         + n_G0 * math.log(1.0 - p_G)
     )
     count_prob_alt = float(math.exp(log_count_prob_alt)) if log_count_prob_alt > math.log(np.finfo(float).tiny) else 0.0
-    score_exact_alt = r_N * quality * (-math.log(max(count_prob_alt, params.eps)))
+    score_exact_alt = r_real * quality_real * (-math.log(max(count_prob_alt, params.eps)))
 
     return {
-        "N": N,
-        "n_B": n_B,
-        "n_G": n_G,
-        "m": m,
+        "N": N_real,
+        "n_B": n_B_real,
+        "n_G": n_G_real,
+        "m": m_real,
+        "N_real": N_real,
+        "n_B_real": n_B_real,
+        "n_G_real": n_G_real,
+        "m_real": m_real,
+        "n_B1_eff": n_B1_eff,
+        "n_B0_eff": n_B0_eff,
+        "n_G1_eff": n_G1_eff,
+        "n_G0_eff": n_G0_eff,
+        "N_eff": N_eff,
+        "B_eff": B_eff,
+        "m_eff": m_eff,
+        "x_obs": x_obs,
         "n_B1": n_B1,
         "n_B0": n_B0,
         "n_G1": n_G1,
         "n_G0": n_G0,
         "p_B": p_B,
         "p_G": p_G,
+        "virtual_good_h": virtual_good_h,
         "w_B0": w_B0,
         "w_G1": w_G1,
         "log_likelihood": log_likelihood,
@@ -200,10 +241,14 @@ def score_process_counts(
         "ideal_log_likelihood": ideal_log_likelihood,
         "penalty_raw": penalty_raw,
         "J_bal": J_bal,
-        "quality": quality,
-        "p_tail": p_tail,
-        "evidence": evidence,
-        "r_N": r_N,
+        "quality": quality_real,
+        "quality_real": quality_real,
+        "p_tail": p_tail_eff,
+        "p_tail_eff": p_tail_eff,
+        "evidence": evidence_eff,
+        "evidence_eff": evidence_eff,
+        "r_N": r_real,
+        "r_real": r_real,
         "score": score,
         "log_count_prob_alt": log_count_prob_alt,
         "count_prob_alt": count_prob_alt,
@@ -211,16 +256,21 @@ def score_process_counts(
     }
 
 
+def _normalize_good_bad(series: pd.Series) -> pd.Series:
+    normalized = series.astype(str).str.strip().str.lower()
+    return normalized.map({"good": "G", "g": "G", "bad": "B", "b": "B"})
+
+
 def _validate_input_dataframe(df: pd.DataFrame) -> None:
-    required = {"process_id", "wafer_id", "state", "y"}
+    required = {"step_seq", "root_lot_id", "wafer_id", "good_bad", "y"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-    states = set(df["state"].dropna().unique())
-    invalid_states = states - {"G", "B"}
-    if invalid_states:
-        raise ValueError(f"Invalid state values: {sorted(invalid_states)}")
+    good_bad = _normalize_good_bad(df["good_bad"])
+    invalid_good_bad = sorted(set(df.loc[good_bad.isna(), "good_bad"].astype(str)))
+    if invalid_good_bad:
+        raise ValueError(f"Invalid good_bad values: {invalid_good_bad}")
 
     y_values = set(df["y"].dropna().unique())
     invalid_y = y_values - {0, 1}
@@ -229,22 +279,22 @@ def _validate_input_dataframe(df: pd.DataFrame) -> None:
 
 
 def score_process_dataframe(df: pd.DataFrame, params: Optional[ScoreParams] = None) -> pd.DataFrame:
-    """Score all process_id groups in a wafer-level DataFrame."""
+    """Score all step_seq groups in a wafer-level DataFrame."""
     params = params or ScoreParams()
     _validate_input_dataframe(df)
 
     rows: List[Dict[str, Any]] = []
-    for process_id, group in df.groupby("process_id", sort=False):
-        state = group["state"]
+    for step_seq, group in df.groupby("step_seq", sort=False):
+        good_bad = _normalize_good_bad(group["good_bad"])
         y = group["y"].astype(int)
         result = score_process_counts(
-            n_B1=int(((state == "B") & (y == 1)).sum()),
-            n_B0=int(((state == "B") & (y == 0)).sum()),
-            n_G1=int(((state == "G") & (y == 1)).sum()),
-            n_G0=int(((state == "G") & (y == 0)).sum()),
+            n_B1=int(((good_bad == "B") & (y == 1)).sum()),
+            n_B0=int(((good_bad == "B") & (y == 0)).sum()),
+            n_G1=int(((good_bad == "G") & (y == 1)).sum()),
+            n_G0=int(((good_bad == "G") & (y == 0)).sum()),
             params=params,
         )
-        result["process_id"] = process_id
+        result["step_seq"] = step_seq
         rows.append(result)
 
     if not rows:
@@ -252,31 +302,39 @@ def score_process_dataframe(df: pd.DataFrame, params: Optional[ScoreParams] = No
     return pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
 
 
-def make_case(process_id: str, n_B1: int, n_B0: int, n_G1: int, n_G0: int) -> pd.DataFrame:
-    """Create wafer-level rows from count inputs for one process."""
+def make_case(
+    step_seq: str,
+    n_B1: int,
+    n_B0: int,
+    n_G1: int,
+    n_G0: int,
+    root_lot_id: Optional[str] = None,
+) -> pd.DataFrame:
+    """Create wafer-level rows from count inputs for one process step."""
     _validate_counts(n_B1, n_B0, n_G1, n_G0)
 
     rows: List[Dict[str, Any]] = []
     total = int(n_B1) + int(n_B0) + int(n_G1) + int(n_G0)
-    wafer_id_width = max(2, len(str(total)))
+    root_lot_id = root_lot_id or "LOT01"
 
-    def add_rows(prefix: str, state: str, y: int, count: int) -> None:
+    def add_rows(prefix: str, good_bad: str, y: int, count: int) -> None:
         start = len(rows) + 1
         for offset in range(int(count)):
             rows.append(
                 {
-                    "process_id": process_id,
-                    "wafer_id": f"W{start + offset:0{wafer_id_width}d}",
-                    "state": state,
+                    "step_seq": step_seq,
+                    "root_lot_id": root_lot_id,
+                    "wafer_id": start + offset,
+                    "good_bad": good_bad,
                     "y": y,
                 }
             )
 
-    add_rows("B1", "B", 1, n_B1)
-    add_rows("B0", "B", 0, n_B0)
-    add_rows("G1", "G", 1, n_G1)
-    add_rows("G0", "G", 0, n_G0)
-    return pd.DataFrame(rows, columns=["process_id", "wafer_id", "state", "y"])
+    add_rows("B1", "bad", 1, n_B1)
+    add_rows("B0", "bad", 0, n_B0)
+    add_rows("G1", "good", 1, n_G1)
+    add_rows("G0", "good", 0, n_G0)
+    return pd.DataFrame(rows, columns=["step_seq", "root_lot_id", "wafer_id", "good_bad", "y"])
 
 
 def _assert_close_to_zero(value: float, name: str, tol: float = 1e-12) -> None:
@@ -284,18 +342,22 @@ def _assert_close_to_zero(value: float, name: str, tol: float = 1e-12) -> None:
 
 
 def _run_sanity_checks(result_df: pd.DataFrame) -> None:
-    by_id = result_df.set_index("process_id")
+    by_id = result_df.set_index("step_seq")
     score = by_id["score"]
+    evidence = by_id["evidence_eff"]
 
     assert score["lot_perfect_N25"] > score["medium_perfect_N10"]
     assert score["medium_perfect_N10"] > score["tiny_perfect_N2"]
+    assert score["no_good_N5"] > score["tiny_single_bad_N1"]
+    assert score["lot_perfect_N25"] > score["no_good_N5"]
     assert score["lot_perfect_N25"] > score["noisy_good_in_y1_N25"]
     assert score["noisy_good_in_y1_N25"] > score["bad_missed_N25"]
+    assert score["all_y1_N25"] < score["no_good_N5"]
+    assert evidence["no_good_N5"] > 4.0 - 1e-2
+    assert evidence["tiny_single_bad_N1"] > 1.3
 
-    _assert_close_to_zero(score["all_y1_N25"], "all_y1_N25 score")
     _assert_close_to_zero(score["all_y0_N25"], "all_y0_N25 score")
     _assert_close_to_zero(score["no_bad_N25"], "no_bad_N25 score")
-    _assert_close_to_zero(score["no_good_N5"], "no_good_N5 score")
 
 
 def plot_ranked_cases(
@@ -328,13 +390,15 @@ def plot_ranked_cases(
 
     for rank, (_, row) in enumerate(ranked.iterrows(), start=1):
         ax = axes[rank - 1]
-        process_id = row["process_id"]
+        step_seq = row["step_seq"]
         case_df = (
-            df.loc[df["process_id"] == process_id, ["wafer_id", "state", "y"]]
-            .sort_values("wafer_id", kind="stable")
+            df.loc[df["step_seq"] == step_seq, ["root_lot_id", "wafer_id", "good_bad", "y"]]
+            .sort_values(["root_lot_id", "wafer_id"], kind="stable")
             .reset_index(drop=True)
         )
         case_df["x_pos"] = np.arange(1, len(case_df) + 1)
+        case_df["wafer_key"] = case_df["root_lot_id"].astype(str) + "/" + case_df["wafer_id"].astype(str)
+        case_df["good_bad_norm"] = _normalize_good_bad(case_df["good_bad"])
 
         ax.axhspan(0.5, 1.35, color="#fee2e2", alpha=0.25, zorder=0)
         ax.axhspan(-0.35, 0.5, color="#dbeafe", alpha=0.18, zorder=0)
@@ -342,7 +406,7 @@ def plot_ranked_cases(
         ax.axhline(1, color="#94a3b8", linewidth=0.8, zorder=1)
 
         for state, style in state_style.items():
-            subset = case_df[case_df["state"] == state]
+            subset = case_df[case_df["good_bad_norm"] == state]
             if subset.empty:
                 continue
             ax.scatter(
@@ -362,17 +426,17 @@ def plot_ranked_cases(
         ax.set_yticks([0, 1])
         ax.set_ylabel("y")
         ax.set_xticks(case_df["x_pos"])
-        ax.set_xticklabels(case_df["wafer_id"], rotation=90, fontsize=7)
+        ax.set_xticklabels(case_df["wafer_key"], rotation=90, fontsize=6)
         ax.grid(axis="x", color="#e5e7eb", linewidth=0.5)
         ax.set_title(
-            f"{rank:02d}. {process_id} | score={row['score']:.4g} | "
+            f"{rank:02d}. step_seq={step_seq} | score={row['score']:.4g} | "
             f"quality={row['quality']:.3g} | evidence={row['evidence']:.3g}",
             loc="left",
             fontsize=10,
             fontweight="bold",
         )
 
-    axes[-1].set_xlabel("wafer_id order")
+    axes[-1].set_xlabel("root_lot_id / wafer_id order")
     fig.suptitle("Simulation Cases Ranked by Suspicion Score", fontsize=14, fontweight="bold")
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
