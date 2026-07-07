@@ -51,6 +51,28 @@ DISPLAY_COLUMNS = [
 ]
 
 
+SINGLE_STEP_LOT_REQUIRED_COLUMNS = {"root_lot_id", "wafer_id", "good_bad", "y"}
+
+SINGLE_STEP_LOT_OUTPUT_COLUMNS = [
+    "step_seq",
+    "root_lot_id",
+    "input_rows",
+    "N_real",
+    "N_eff",
+    "B_eff",
+    "m_eff",
+    "n_B1",
+    "n_B0",
+    "n_G1",
+    "n_G0",
+    "quality_real",
+    "p_tail_eff",
+    "evidence_eff",
+    "r_real",
+    "score",
+]
+
+
 def _safe_prob(p: float, eps: float) -> float:
     """Clamp a probability away from 0 and 1 for stable log/ratio math."""
     return min(max(float(p), eps), 1.0 - eps)
@@ -261,21 +283,145 @@ def _normalize_good_bad(series: pd.Series) -> pd.Series:
     return normalized.map({"good": "G", "g": "G", "bad": "B", "b": "B"})
 
 
+def _normalize_y(series: pd.Series) -> pd.Series:
+    """Normalize y to numeric values while preserving invalid rows for checks."""
+    return pd.to_numeric(series, errors="coerce")
+
+
+def _invalid_y_mask(series: pd.Series) -> pd.Series:
+    y = _normalize_y(series)
+    return y.isna() | ((y % 1) != 0) | ~y.isin([0, 1])
+
+
+def _to_pandas_dataframe(data: Any) -> pd.DataFrame:
+    """Return a pandas DataFrame from pandas or polars DataFrame-like input."""
+    if isinstance(data, pd.DataFrame):
+        return data.copy()
+
+    if hasattr(data, "collect") and callable(data.collect):
+        data = data.collect()
+
+    if hasattr(data, "to_dicts") and callable(data.to_dicts):
+        return pd.DataFrame(data.to_dicts())
+
+    if hasattr(data, "to_pandas") and callable(data.to_pandas):
+        return data.to_pandas().copy()
+
+    raise TypeError("Input must be a pandas DataFrame or a polars DataFrame/LazyFrame.")
+
+
 def _validate_input_dataframe(df: pd.DataFrame) -> None:
     required = {"step_seq", "root_lot_id", "wafer_id", "good_bad", "y"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
+    for column in ["step_seq", "root_lot_id", "wafer_id"]:
+        if df[column].isna().any():
+            raise ValueError(f"{column} must not contain missing values.")
+
     good_bad = _normalize_good_bad(df["good_bad"])
     invalid_good_bad = sorted(set(df.loc[good_bad.isna(), "good_bad"].astype(str)))
     if invalid_good_bad:
         raise ValueError(f"Invalid good_bad values: {invalid_good_bad}")
 
-    y_values = set(df["y"].dropna().unique())
-    invalid_y = y_values - {0, 1}
-    if invalid_y:
-        raise ValueError(f"Invalid y values: {sorted(invalid_y)}")
+    invalid_y = _invalid_y_mask(df["y"])
+    if invalid_y.any():
+        invalid = sorted(set(df.loc[invalid_y, "y"].astype(str)))
+        raise ValueError(f"Invalid y values: {invalid}")
+
+
+def _validate_single_step_lot_dataframe(df: pd.DataFrame, max_wafers: int) -> str:
+    missing = SINGLE_STEP_LOT_REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+    if df.empty:
+        raise ValueError("Input DataFrame must contain at least one wafer row.")
+    if len(df) > max_wafers:
+        raise ValueError(f"Expected at most {max_wafers} wafer rows, got {len(df)}.")
+
+    if df["root_lot_id"].isna().any():
+        raise ValueError("root_lot_id must not contain missing values.")
+    root_lot_ids = df["root_lot_id"].unique()
+    if len(root_lot_ids) != 1:
+        raise ValueError(f"Expected exactly one root_lot_id, got {list(root_lot_ids)}.")
+    root_lot_id = root_lot_ids[0]
+
+    wafer_ids = pd.to_numeric(df["wafer_id"], errors="coerce")
+    if wafer_ids.isna().any():
+        invalid = sorted(set(df.loc[wafer_ids.isna(), "wafer_id"].astype(str)))
+        raise ValueError(f"wafer_id must be numeric values from 1 to {max_wafers}: {invalid}")
+    if ((wafer_ids % 1) != 0).any():
+        raise ValueError("wafer_id must be integer-valued.")
+    if ((wafer_ids < 1) | (wafer_ids > max_wafers)).any():
+        invalid = sorted(set(df.loc[(wafer_ids < 1) | (wafer_ids > max_wafers), "wafer_id"].astype(str)))
+        raise ValueError(f"wafer_id must be in 1..{max_wafers}: {invalid}")
+
+    if df.duplicated(["root_lot_id", "wafer_id"]).any():
+        duplicated = df.loc[df.duplicated(["root_lot_id", "wafer_id"], keep=False), ["root_lot_id", "wafer_id"]]
+        raise ValueError(f"Duplicate wafer identity rows found: {duplicated.to_dict('records')}")
+
+    good_bad = _normalize_good_bad(df["good_bad"])
+    invalid_good_bad = sorted(set(df.loc[good_bad.isna(), "good_bad"].astype(str)))
+    if invalid_good_bad:
+        raise ValueError(f"Invalid good_bad values: {invalid_good_bad}")
+
+    invalid_y = _invalid_y_mask(df["y"])
+    if invalid_y.any():
+        invalid = sorted(set(df.loc[invalid_y, "y"].astype(str)))
+        raise ValueError(f"Invalid y values: {invalid}")
+
+    return str(root_lot_id)
+
+
+def score_single_step_lot_dataframe(
+    data: Any,
+    step_seq: Optional[str] = None,
+    params: Optional[ScoreParams] = None,
+    as_dataframe: bool = False,
+    max_wafers: int = 25,
+) -> Dict[str, Any] | pd.DataFrame:
+    """
+    Score one user-provided step/root-lot wafer table.
+
+    Required input columns are root_lot_id, wafer_id, good_bad, and y. The input
+    may be a pandas DataFrame or a polars DataFrame/LazyFrame. If a step_seq
+    column is present it must contain exactly one value; otherwise step_seq can
+    be supplied as an argument and defaults to "input_step".
+    """
+    params = params or ScoreParams()
+    df = _to_pandas_dataframe(data)
+    root_lot_id = _validate_single_step_lot_dataframe(df, max_wafers=max_wafers)
+
+    if "step_seq" in df.columns:
+        if df["step_seq"].isna().any():
+            raise ValueError("step_seq must not contain missing values when provided as a column.")
+        step_values = df["step_seq"].unique()
+        if len(step_values) != 1:
+            raise ValueError(f"Expected exactly one step_seq value, got {list(step_values)}.")
+        inferred_step_seq = str(step_values[0])
+        if step_seq is not None and str(step_seq) != inferred_step_seq:
+            raise ValueError(f"step_seq argument {step_seq!r} does not match input {inferred_step_seq!r}.")
+        step_seq = inferred_step_seq
+    else:
+        step_seq = str(step_seq) if step_seq is not None else "input_step"
+
+    good_bad = _normalize_good_bad(df["good_bad"])
+    y = _normalize_y(df["y"]).astype(int)
+    result: Dict[str, Any] = score_process_counts(
+        n_B1=int(((good_bad == "B") & (y == 1)).sum()),
+        n_B0=int(((good_bad == "B") & (y == 0)).sum()),
+        n_G1=int(((good_bad == "G") & (y == 1)).sum()),
+        n_G0=int(((good_bad == "G") & (y == 0)).sum()),
+        params=params,
+    )
+    result["step_seq"] = step_seq
+    result["root_lot_id"] = root_lot_id
+    result["input_rows"] = int(len(df))
+
+    if as_dataframe:
+        return pd.DataFrame([result])
+    return result
 
 
 def score_process_dataframe(df: pd.DataFrame, params: Optional[ScoreParams] = None) -> pd.DataFrame:
@@ -286,7 +432,7 @@ def score_process_dataframe(df: pd.DataFrame, params: Optional[ScoreParams] = No
     rows: List[Dict[str, Any]] = []
     for step_seq, group in df.groupby("step_seq", sort=False):
         good_bad = _normalize_good_bad(group["good_bad"])
-        y = group["y"].astype(int)
+        y = _normalize_y(group["y"]).astype(int)
         result = score_process_counts(
             n_B1=int(((good_bad == "B") & (y == 1)).sum()),
             n_B0=int(((good_bad == "B") & (y == 0)).sum()),
