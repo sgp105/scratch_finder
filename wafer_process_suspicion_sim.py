@@ -545,6 +545,7 @@ def plot_ranked_cases(
     result_df: pd.DataFrame,
     output_path: Optional[str | Path] = None,
     close: bool = False,
+    title: str = "Simulation Cases Ranked by Suspicion Score",
 ):
     """Plot each process in score order with wafer_id along x and context y on y."""
     mpl_config_dir = Path(tempfile.gettempdir()) / "wafer_process_suspicion_matplotlib"
@@ -608,6 +609,11 @@ def plot_ranked_cases(
         ax.set_xticks(case_df["x_pos"])
         ax.set_xticklabels(case_df["wafer_key"], rotation=90, fontsize=6)
         ax.grid(axis="x", color="#e5e7eb", linewidth=0.5)
+        lot_end_positions = (
+            case_df.groupby("root_lot_id", sort=False)["x_pos"].max().to_numpy()
+        )
+        for lot_end in lot_end_positions[:-1]:
+            ax.axvline(lot_end + 0.5, color="#64748b", linewidth=1.2, zorder=2)
         ax.set_title(
             f"{rank:02d}. step_seq={step_seq} | score={row['score']:.4g} | "
             f"quality={row['quality']:.3g} | evidence={row['evidence']:.3g}",
@@ -617,7 +623,7 @@ def plot_ranked_cases(
         )
 
     axes[-1].set_xlabel("root_lot_id / wafer_id order")
-    fig.suptitle("Simulation Cases Ranked by Suspicion Score", fontsize=14, fontweight="bold")
+    fig.suptitle(title, fontsize=14, fontweight="bold")
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
         fig.legend(handles, labels, loc="upper right", frameon=False)
@@ -647,6 +653,63 @@ def make_simulation_dataframe() -> pd.DataFrame:
         make_case("no_good_N5", n_B1=5, n_B0=0, n_G1=0, n_G0=0),
     ]
     return pd.concat(cases, ignore_index=True)
+
+
+def make_multi_lot_simulation_dataframe() -> pd.DataFrame:
+    """Build four simulation cases, each pooled from three root lots."""
+    case_specs = {
+        "three_lot_perfect": {
+            "LOT_A": (2, 0, 0, 6),
+            "LOT_B": (2, 0, 0, 6),
+            "LOT_C": (2, 0, 0, 6),
+        },
+        "three_lot_good_noise": {
+            "LOT_A": (2, 0, 0, 6),
+            "LOT_B": (2, 0, 3, 3),
+            "LOT_C": (2, 0, 0, 6),
+        },
+        "three_lot_bad_missed": {
+            "LOT_A": (2, 0, 0, 6),
+            "LOT_B": (0, 2, 0, 6),
+            "LOT_C": (2, 0, 0, 6),
+        },
+        "three_lot_random_mix": {
+            "LOT_A": (1, 1, 1, 5),
+            "LOT_B": (1, 1, 2, 4),
+            "LOT_C": (1, 1, 1, 5),
+        },
+    }
+
+    frames: List[pd.DataFrame] = []
+    for step_seq, lot_specs in case_specs.items():
+        for root_lot_id, counts in lot_specs.items():
+            frames.append(
+                make_case(
+                    step_seq,
+                    n_B1=counts[0],
+                    n_B0=counts[1],
+                    n_G1=counts[2],
+                    n_G0=counts[3],
+                    root_lot_id=root_lot_id,
+                )
+            )
+    return pd.concat(frames, ignore_index=True)
+
+
+def _run_multi_lot_sanity_checks(result_df: pd.DataFrame) -> None:
+    """Verify that every case pools three lots and preserves expected ranking."""
+    by_id = result_df.set_index("step_seq")
+    assert (by_id["root_lot_count"] == 3).all()
+    assert (by_id["input_rows"] == 24).all()
+    assert all(
+        lot_ids == ["LOT_A", "LOT_B", "LOT_C"]
+        for lot_ids in by_id["root_lot_ids"]
+    )
+
+    score = by_id["score"]
+    assert score["three_lot_perfect"] > score["three_lot_good_noise"]
+    assert score["three_lot_perfect"] > score["three_lot_bad_missed"]
+    assert score["three_lot_perfect"] > score["three_lot_random_mix"]
 
 
 def run_simulation_cases(
