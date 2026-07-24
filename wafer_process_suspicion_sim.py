@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 try:
     from scipy.stats import hypergeom as scipy_hypergeom
@@ -282,28 +282,61 @@ def score_process_counts(
     }
 
 
-def _normalize_good_bad(series: pd.Series) -> pd.Series:
-    normalized = series.astype(str).str.strip().str.lower()
-    return normalized.map({"good": "G", "g": "G", "bad": "B", "b": "B"})
+def _normalize_good_bad_expr() -> pl.Expr:
+    """Return a Polars expression that normalizes good_bad to G or B."""
+    return (
+        pl.col("good_bad")
+        .cast(pl.String, strict=False)
+        .str.strip_chars()
+        .str.to_lowercase()
+        .replace_strict(
+            {"good": "G", "g": "G", "bad": "B", "b": "B"},
+            default=None,
+            return_dtype=pl.String,
+        )
+        .alias("_good_bad_norm")
+    )
 
 
-def _normalize_y(series: pd.Series) -> pd.Series:
-    """Normalize y to numeric values while preserving invalid rows for checks."""
-    return pd.to_numeric(series, errors="coerce")
+def _normalize_y_expr() -> pl.Expr:
+    """Return a non-strict numeric cast for validating context y."""
+    return pl.col("y").cast(pl.Float64, strict=False).alias("_y_number")
 
 
-def _invalid_y_mask(series: pd.Series) -> pd.Series:
-    y = _normalize_y(series)
-    return y.isna() | ((y % 1) != 0) | ~y.isin([0, 1])
+def _with_normalized_columns(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns(_normalize_good_bad_expr(), _normalize_y_expr()).with_columns(
+        pl.col("_y_number").cast(pl.Int64).alias("_y_norm")
+    )
 
 
-def _ordered_root_lot_ids(df: pd.DataFrame) -> List[str]:
+def _to_polars_dataframe(data: pl.DataFrame | pl.LazyFrame) -> pl.DataFrame:
+    """Materialize Polars input as a cloned DataFrame."""
+    if isinstance(data, pl.DataFrame):
+        return data.clone()
+    if isinstance(data, pl.LazyFrame):
+        return data.collect()
+    raise TypeError("Input must be a polars DataFrame or LazyFrame.")
+
+
+def _ordered_root_lot_ids(df: pl.DataFrame) -> List[str]:
     """Return distinct root lot IDs in their first-seen order."""
-    return [str(value) for value in pd.unique(df["root_lot_id"])]
+    return (
+        df.get_column("root_lot_id")
+        .cast(pl.String)
+        .unique(maintain_order=True)
+        .to_list()
+    )
+
+
+def _display_invalid_values(df: pl.DataFrame, column: str) -> List[str]:
+    return [
+        str(value)
+        for value in df.get_column(column).unique(maintain_order=True).to_list()
+    ]
 
 
 def _validate_wafer_identity_rows(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     identity_columns: List[str],
     max_wafers: int,
 ) -> None:
@@ -311,47 +344,72 @@ def _validate_wafer_identity_rows(
     if max_wafers < 1:
         raise ValueError("max_wafers must be at least 1.")
 
-    wafer_ids = pd.to_numeric(df["wafer_id"], errors="coerce")
-    if wafer_ids.isna().any():
-        invalid = sorted(set(df.loc[wafer_ids.isna(), "wafer_id"].astype(str)))
-        raise ValueError(f"wafer_id must be numeric values from 1 to {max_wafers}: {invalid}")
-    if ((wafer_ids % 1) != 0).any():
+    checked = df.with_columns(
+        pl.col("wafer_id").cast(pl.Float64, strict=False).alias("_wafer_id_number")
+    )
+    invalid_numeric = checked.filter(
+        pl.col("_wafer_id_number").is_null()
+        | pl.col("_wafer_id_number").is_nan()
+    )
+    if invalid_numeric.height:
+        invalid = _display_invalid_values(invalid_numeric, "wafer_id")
+        raise ValueError(
+            f"wafer_id must be numeric values from 1 to {max_wafers}: {invalid}"
+        )
+
+    non_integer = checked.filter((pl.col("_wafer_id_number") % 1) != 0)
+    if non_integer.height:
         raise ValueError("wafer_id must be integer-valued.")
-    invalid_range = (wafer_ids < 1) | (wafer_ids > max_wafers)
-    if invalid_range.any():
-        invalid = sorted(set(df.loc[invalid_range, "wafer_id"].astype(str)))
-        raise ValueError(f"wafer_id must be in 1..{max_wafers} within each root lot: {invalid}")
 
-    if df.duplicated(identity_columns).any():
-        duplicated = df.loc[df.duplicated(identity_columns, keep=False), identity_columns]
-        raise ValueError(f"Duplicate wafer identity rows found: {duplicated.to_dict('records')}")
+    invalid_range = checked.filter(
+        (pl.col("_wafer_id_number") < 1)
+        | (pl.col("_wafer_id_number") > max_wafers)
+    )
+    if invalid_range.height:
+        invalid = _display_invalid_values(invalid_range, "wafer_id")
+        raise ValueError(
+            f"wafer_id must be in 1..{max_wafers} within each root lot: {invalid}"
+        )
 
-
-def _to_pandas_dataframe(data: Any) -> pd.DataFrame:
-    """Return a pandas DataFrame from pandas or polars DataFrame-like input."""
-    if isinstance(data, pd.DataFrame):
-        return data.copy()
-
-    if hasattr(data, "collect") and callable(data.collect):
-        data = data.collect()
-
-    if hasattr(data, "to_dicts") and callable(data.to_dicts):
-        return pd.DataFrame(data.to_dicts())
-
-    if hasattr(data, "to_pandas") and callable(data.to_pandas):
-        return data.to_pandas().copy()
-
-    raise TypeError("Input must be a pandas DataFrame or a polars DataFrame/LazyFrame.")
+    duplicated = (
+        df.group_by(identity_columns, maintain_order=True)
+        .agg(pl.len().alias("_row_count"))
+        .filter(pl.col("_row_count") > 1)
+        .select(identity_columns)
+    )
+    if duplicated.height:
+        raise ValueError(
+            f"Duplicate wafer identity rows found: {duplicated.to_dicts()}"
+        )
 
 
-def _validate_input_dataframe(df: pd.DataFrame, max_wafers: int = 25) -> None:
+def _validate_good_bad_and_y(df: pl.DataFrame) -> None:
+    checked = df.with_columns(_normalize_good_bad_expr(), _normalize_y_expr())
+
+    invalid_good_bad = checked.filter(pl.col("_good_bad_norm").is_null())
+    if invalid_good_bad.height:
+        invalid = _display_invalid_values(invalid_good_bad, "good_bad")
+        raise ValueError(f"Invalid good_bad values: {invalid}")
+
+    invalid_y = checked.filter(
+        pl.col("_y_number").is_null()
+        | pl.col("_y_number").is_nan()
+        | ((pl.col("_y_number") % 1) != 0)
+        | ~pl.col("_y_number").is_in([0.0, 1.0])
+    )
+    if invalid_y.height:
+        invalid = _display_invalid_values(invalid_y, "y")
+        raise ValueError(f"Invalid y values: {invalid}")
+
+
+def _validate_input_dataframe(df: pl.DataFrame, max_wafers: int = 25) -> None:
     required = {"step_seq", "root_lot_id", "wafer_id", "good_bad", "y"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
     for column in ["step_seq", "root_lot_id", "wafer_id"]:
-        if df[column].isna().any():
+        if df.get_column(column).null_count():
             raise ValueError(f"{column} must not contain missing values.")
 
     _validate_wafer_identity_rows(
@@ -359,127 +417,160 @@ def _validate_input_dataframe(df: pd.DataFrame, max_wafers: int = 25) -> None:
         identity_columns=["step_seq", "root_lot_id", "wafer_id"],
         max_wafers=max_wafers,
     )
-
-    good_bad = _normalize_good_bad(df["good_bad"])
-    invalid_good_bad = sorted(set(df.loc[good_bad.isna(), "good_bad"].astype(str)))
-    if invalid_good_bad:
-        raise ValueError(f"Invalid good_bad values: {invalid_good_bad}")
-
-    invalid_y = _invalid_y_mask(df["y"])
-    if invalid_y.any():
-        invalid = sorted(set(df.loc[invalid_y, "y"].astype(str)))
-        raise ValueError(f"Invalid y values: {invalid}")
+    _validate_good_bad_and_y(df)
 
 
-def _validate_single_step_lot_dataframe(df: pd.DataFrame, max_wafers: int) -> List[str]:
+def _validate_single_step_lot_dataframe(
+    df: pl.DataFrame,
+    max_wafers: int,
+) -> List[str]:
     missing = SINGLE_STEP_LOT_REQUIRED_COLUMNS - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
-    if df.empty:
+    if df.is_empty():
         raise ValueError("Input DataFrame must contain at least one wafer row.")
-
-    if df["root_lot_id"].isna().any():
+    if df.get_column("root_lot_id").null_count():
         raise ValueError("root_lot_id must not contain missing values.")
+
     root_lot_ids = _ordered_root_lot_ids(df)
     _validate_wafer_identity_rows(
         df,
         identity_columns=["root_lot_id", "wafer_id"],
         max_wafers=max_wafers,
     )
-
-    good_bad = _normalize_good_bad(df["good_bad"])
-    invalid_good_bad = sorted(set(df.loc[good_bad.isna(), "good_bad"].astype(str)))
-    if invalid_good_bad:
-        raise ValueError(f"Invalid good_bad values: {invalid_good_bad}")
-
-    invalid_y = _invalid_y_mask(df["y"])
-    if invalid_y.any():
-        invalid = sorted(set(df.loc[invalid_y, "y"].astype(str)))
-        raise ValueError(f"Invalid y values: {invalid}")
-
+    _validate_good_bad_and_y(df)
     return root_lot_ids
 
 
-def score_single_step_lot_dataframe(
-    data: Any,
-    step_seq: Optional[str] = None,
-    params: Optional[ScoreParams] = None,
-    as_dataframe: bool = False,
-    max_wafers: int = 25,
-) -> Dict[str, Any] | pd.DataFrame:
-    """
-    Score one user-provided step containing one or more root lots.
+def _count_good_bad_context(df: pl.DataFrame) -> Dict[str, int]:
+    normalized = _with_normalized_columns(df)
+    row = normalized.select(
+        (
+            (pl.col("_good_bad_norm") == "B") & (pl.col("_y_norm") == 1)
+        ).sum().alias("n_B1"),
+        (
+            (pl.col("_good_bad_norm") == "B") & (pl.col("_y_norm") == 0)
+        ).sum().alias("n_B0"),
+        (
+            (pl.col("_good_bad_norm") == "G") & (pl.col("_y_norm") == 1)
+        ).sum().alias("n_G1"),
+        (
+            (pl.col("_good_bad_norm") == "G") & (pl.col("_y_norm") == 0)
+        ).sum().alias("n_G0"),
+    ).row(0, named=True)
+    return {name: int(value) for name, value in row.items()}
 
-    Required input columns are root_lot_id, wafer_id, good_bad, and y. The input
-    may be a pandas DataFrame or a polars DataFrame/LazyFrame. If a step_seq
-    column is present it must contain exactly one value; otherwise step_seq can
-    be supplied as an argument and defaults to "input_step". All input lots are
-    pooled into one count table and scored once for that step. max_wafers limits
-    wafer_id within each root lot; it does not limit the number of input lots.
+
+def score_single_step_lot_dataframe(
+    data: pl.DataFrame | pl.LazyFrame,
+    step_seq: Optional[Any] = None,
+    params: Optional[ScoreParams] = None,
+    max_wafers: int = 25,
+) -> pl.DataFrame:
+    """
+    Score one step containing one or more root lots and return one Polars row.
+
+    Required input columns are root_lot_id, wafer_id, good_bad, and y. If a
+    step_seq column is present it must contain exactly one value; otherwise
+    step_seq can be supplied as an argument and defaults to "input_step". All
+    input lots are pooled into one count table and scored once for that step.
+    max_wafers limits wafer_id within each root lot, not the number of lots.
     """
     params = params or ScoreParams()
-    df = _to_pandas_dataframe(data)
-    root_lot_ids = _validate_single_step_lot_dataframe(df, max_wafers=max_wafers)
+    df = _to_polars_dataframe(data)
+    root_lot_ids = _validate_single_step_lot_dataframe(
+        df,
+        max_wafers=max_wafers,
+    )
 
     if "step_seq" in df.columns:
-        if df["step_seq"].isna().any():
-            raise ValueError("step_seq must not contain missing values when provided as a column.")
-        step_values = df["step_seq"].unique()
+        if df.get_column("step_seq").null_count():
+            raise ValueError(
+                "step_seq must not contain missing values when provided as a column."
+            )
+        step_values = (
+            df.get_column("step_seq").unique(maintain_order=True).to_list()
+        )
         if len(step_values) != 1:
-            raise ValueError(f"Expected exactly one step_seq value, got {list(step_values)}.")
-        inferred_step_seq = str(step_values[0])
-        if step_seq is not None and str(step_seq) != inferred_step_seq:
-            raise ValueError(f"step_seq argument {step_seq!r} does not match input {inferred_step_seq!r}.")
+            raise ValueError(
+                f"Expected exactly one step_seq value, got {step_values}."
+            )
+        inferred_step_seq = step_values[0]
+        if step_seq is not None and step_seq != inferred_step_seq:
+            raise ValueError(
+                f"step_seq argument {step_seq!r} does not match "
+                f"input {inferred_step_seq!r}."
+            )
         step_seq = inferred_step_seq
-    else:
-        step_seq = str(step_seq) if step_seq is not None else "input_step"
+    elif step_seq is None:
+        step_seq = "input_step"
 
-    good_bad = _normalize_good_bad(df["good_bad"])
-    y = _normalize_y(df["y"]).astype(int)
     result: Dict[str, Any] = score_process_counts(
-        n_B1=int(((good_bad == "B") & (y == 1)).sum()),
-        n_B0=int(((good_bad == "B") & (y == 0)).sum()),
-        n_G1=int(((good_bad == "G") & (y == 1)).sum()),
-        n_G0=int(((good_bad == "G") & (y == 0)).sum()),
+        **_count_good_bad_context(df),
         params=params,
     )
     result["step_seq"] = step_seq
-    result["root_lot_id"] = root_lot_ids[0] if len(root_lot_ids) == 1 else None
+    result["root_lot_id"] = (
+        root_lot_ids[0] if len(root_lot_ids) == 1 else None
+    )
     result["root_lot_count"] = len(root_lot_ids)
     result["root_lot_ids"] = root_lot_ids
-    result["input_rows"] = int(len(df))
-
-    if as_dataframe:
-        return pd.DataFrame([result])
-    return result
+    result["input_rows"] = df.height
+    return pl.DataFrame([result], infer_schema_length=None)
 
 
-def score_process_dataframe(data: Any, params: Optional[ScoreParams] = None) -> pd.DataFrame:
-    """Pool all lots within each step_seq and score every step once."""
+def score_process_dataframe(
+    data: pl.DataFrame | pl.LazyFrame,
+    params: Optional[ScoreParams] = None,
+) -> pl.DataFrame:
+    """Pool all lots within each step_seq and return one Polars row per step."""
     params = params or ScoreParams()
-    df = _to_pandas_dataframe(data)
+    df = _to_polars_dataframe(data)
     _validate_input_dataframe(df)
+    if df.is_empty():
+        return pl.DataFrame()
+
+    normalized = _with_normalized_columns(df)
+    counts_df = normalized.group_by("step_seq", maintain_order=True).agg(
+        pl.col("root_lot_id").n_unique().alias("root_lot_count"),
+        pl.col("root_lot_id")
+        .cast(pl.String)
+        .unique(maintain_order=True)
+        .alias("root_lot_ids"),
+        pl.len().alias("input_rows"),
+        (
+            (pl.col("_good_bad_norm") == "B") & (pl.col("_y_norm") == 1)
+        ).sum().alias("n_B1"),
+        (
+            (pl.col("_good_bad_norm") == "B") & (pl.col("_y_norm") == 0)
+        ).sum().alias("n_B0"),
+        (
+            (pl.col("_good_bad_norm") == "G") & (pl.col("_y_norm") == 1)
+        ).sum().alias("n_G1"),
+        (
+            (pl.col("_good_bad_norm") == "G") & (pl.col("_y_norm") == 0)
+        ).sum().alias("n_G0"),
+    )
 
     rows: List[Dict[str, Any]] = []
-    for step_seq, group in df.groupby("step_seq", sort=False):
-        good_bad = _normalize_good_bad(group["good_bad"])
-        y = _normalize_y(group["y"]).astype(int)
-        result = score_process_counts(
-            n_B1=int(((good_bad == "B") & (y == 1)).sum()),
-            n_B0=int(((good_bad == "B") & (y == 0)).sum()),
-            n_G1=int(((good_bad == "G") & (y == 1)).sum()),
-            n_G0=int(((good_bad == "G") & (y == 0)).sum()),
+    for count_row in counts_df.iter_rows(named=True):
+        result: Dict[str, Any] = score_process_counts(
+            n_B1=int(count_row["n_B1"]),
+            n_B0=int(count_row["n_B0"]),
+            n_G1=int(count_row["n_G1"]),
+            n_G0=int(count_row["n_G0"]),
             params=params,
         )
-        result["step_seq"] = step_seq
-        result["root_lot_count"] = int(group["root_lot_id"].nunique())
-        result["root_lot_ids"] = _ordered_root_lot_ids(group)
-        result["input_rows"] = int(len(group))
+        result["step_seq"] = count_row["step_seq"]
+        result["root_lot_count"] = int(count_row["root_lot_count"])
+        result["root_lot_ids"] = count_row["root_lot_ids"]
+        result["input_rows"] = int(count_row["input_rows"])
         rows.append(result)
 
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    return pl.DataFrame(rows, infer_schema_length=None).sort(
+        "score",
+        descending=True,
+    )
 
 
 def make_case(
@@ -489,66 +580,87 @@ def make_case(
     n_G1: int,
     n_G0: int,
     root_lot_id: Optional[str] = None,
-) -> pd.DataFrame:
-    """Create wafer-level rows from count inputs for one process step."""
+) -> pl.DataFrame:
+    """Create Polars wafer rows from count inputs for one process step."""
     _validate_counts(n_B1, n_B0, n_G1, n_G0)
 
-    rows: List[Dict[str, Any]] = []
     total = int(n_B1) + int(n_B0) + int(n_G1) + int(n_G0)
     root_lot_id = root_lot_id or "LOT01"
-
-    def add_rows(prefix: str, good_bad: str, y: int, count: int) -> None:
-        start = len(rows) + 1
-        for offset in range(int(count)):
-            rows.append(
-                {
-                    "step_seq": step_seq,
-                    "root_lot_id": root_lot_id,
-                    "wafer_id": start + offset,
-                    "good_bad": good_bad,
-                    "y": y,
-                }
-            )
-
-    add_rows("B1", "bad", 1, n_B1)
-    add_rows("B0", "bad", 0, n_B0)
-    add_rows("G1", "good", 1, n_G1)
-    add_rows("G0", "good", 0, n_G0)
-    return pd.DataFrame(rows, columns=["step_seq", "root_lot_id", "wafer_id", "good_bad", "y"])
+    good_bad = (
+        ["bad"] * int(n_B1)
+        + ["bad"] * int(n_B0)
+        + ["good"] * int(n_G1)
+        + ["good"] * int(n_G0)
+    )
+    y = (
+        [1] * int(n_B1)
+        + [0] * int(n_B0)
+        + [1] * int(n_G1)
+        + [0] * int(n_G0)
+    )
+    return pl.DataFrame(
+        {
+            "step_seq": [step_seq] * total,
+            "root_lot_id": [root_lot_id] * total,
+            "wafer_id": list(range(1, total + 1)),
+            "good_bad": good_bad,
+            "y": y,
+        },
+        schema={
+            "step_seq": pl.String,
+            "root_lot_id": pl.String,
+            "wafer_id": pl.Int64,
+            "good_bad": pl.String,
+            "y": pl.Int64,
+        },
+    )
 
 
 def _assert_close_to_zero(value: float, name: str, tol: float = 1e-12) -> None:
     assert abs(value) <= tol, f"{name} expected near zero, got {value}"
 
 
-def _run_sanity_checks(result_df: pd.DataFrame) -> None:
-    by_id = result_df.set_index("step_seq")
-    score = by_id["score"]
-    evidence = by_id["evidence_eff"]
+def _result_rows_by_step(result_df: pl.DataFrame) -> Dict[str, Dict[str, Any]]:
+    return {
+        str(row["step_seq"]): row
+        for row in result_df.iter_rows(named=True)
+    }
 
-    assert score["lot_perfect_N25"] > score["medium_perfect_N10"]
-    assert score["medium_perfect_N10"] > score["tiny_perfect_N2"]
-    assert score["no_good_N5"] > score["tiny_single_bad_N1"]
-    assert score["lot_perfect_N25"] > score["no_good_N5"]
-    assert score["lot_perfect_N25"] > score["noisy_good_in_y1_N25"]
-    assert score["noisy_good_in_y1_N25"] > score["bad_missed_N25"]
-    assert score["all_y1_N25"] < score["no_good_N5"]
-    assert evidence["no_good_N5"] > 4.0 - 1e-2
-    assert evidence["tiny_single_bad_N1"] > 1.3
 
-    _assert_close_to_zero(score["all_y0_N25"], "all_y0_N25 score")
-    _assert_close_to_zero(score["no_bad_N25"], "no_bad_N25 score")
+def _run_sanity_checks(result_df: pl.DataFrame) -> None:
+    by_id = _result_rows_by_step(result_df)
+
+    assert by_id["lot_perfect_N25"]["score"] > by_id["medium_perfect_N10"]["score"]
+    assert by_id["medium_perfect_N10"]["score"] > by_id["tiny_perfect_N2"]["score"]
+    assert by_id["no_good_N5"]["score"] > by_id["tiny_single_bad_N1"]["score"]
+    assert by_id["lot_perfect_N25"]["score"] > by_id["no_good_N5"]["score"]
+    assert (
+        by_id["lot_perfect_N25"]["score"]
+        > by_id["noisy_good_in_y1_N25"]["score"]
+    )
+    assert (
+        by_id["noisy_good_in_y1_N25"]["score"]
+        > by_id["bad_missed_N25"]["score"]
+    )
+    assert by_id["all_y1_N25"]["score"] < by_id["no_good_N5"]["score"]
+    assert by_id["no_good_N5"]["evidence_eff"] > 4.0 - 1e-2
+    assert by_id["tiny_single_bad_N1"]["evidence_eff"] > 1.3
+
+    _assert_close_to_zero(by_id["all_y0_N25"]["score"], "all_y0_N25 score")
+    _assert_close_to_zero(by_id["no_bad_N25"]["score"], "no_bad_N25 score")
 
 
 def plot_ranked_cases(
-    df: pd.DataFrame,
-    result_df: pd.DataFrame,
+    df: pl.DataFrame | pl.LazyFrame,
+    result_df: pl.DataFrame | pl.LazyFrame,
     output_path: Optional[str | Path] = None,
     close: bool = False,
     title: str = "Simulation Cases Ranked by Suspicion Score",
 ):
-    """Plot each process in score order with wafer_id along x and context y on y."""
-    mpl_config_dir = Path(tempfile.gettempdir()) / "wafer_process_suspicion_matplotlib"
+    """Plot Polars simulation rows in descending score order."""
+    mpl_config_dir = (
+        Path(tempfile.gettempdir()) / "wafer_process_suspicion_matplotlib"
+    )
     os.environ.setdefault("MPLCONFIGDIR", str(mpl_config_dir))
 
     if output_path is not None:
@@ -557,10 +669,16 @@ def plot_ranked_cases(
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    ranked = result_df.sort_values("score", ascending=False).reset_index(drop=True)
-    n_cases = len(ranked)
+    df = _to_polars_dataframe(df)
+    ranked = _to_polars_dataframe(result_df).sort("score", descending=True)
+    n_cases = ranked.height
     fig_height = max(5.0, 1.75 * n_cases)
-    fig, axes = plt.subplots(n_cases, 1, figsize=(16, fig_height), constrained_layout=True)
+    fig, axes = plt.subplots(
+        n_cases,
+        1,
+        figsize=(16, fig_height),
+        constrained_layout=True,
+    )
     if n_cases == 1:
         axes = [axes]
 
@@ -569,17 +687,23 @@ def plot_ranked_cases(
         "B": {"color": "#dc2626", "marker": "X", "label": "Bad wafer"},
     }
 
-    for rank, (_, row) in enumerate(ranked.iterrows(), start=1):
+    for rank, row in enumerate(ranked.iter_rows(named=True), start=1):
         ax = axes[rank - 1]
         step_seq = row["step_seq"]
         case_df = (
-            df.loc[df["step_seq"] == step_seq, ["root_lot_id", "wafer_id", "good_bad", "y"]]
-            .sort_values(["root_lot_id", "wafer_id"], kind="stable")
-            .reset_index(drop=True)
+            df.filter(pl.col("step_seq") == step_seq)
+            .select("root_lot_id", "wafer_id", "good_bad", "y")
+            .sort("root_lot_id", "wafer_id", maintain_order=True)
+            .with_row_index("x_pos", offset=1)
+            .with_columns(
+                pl.concat_str(
+                    pl.col("root_lot_id").cast(pl.String),
+                    pl.col("wafer_id").cast(pl.String),
+                    separator="/",
+                ).alias("wafer_key"),
+                _normalize_good_bad_expr(),
+            )
         )
-        case_df["x_pos"] = np.arange(1, len(case_df) + 1)
-        case_df["wafer_key"] = case_df["root_lot_id"].astype(str) + "/" + case_df["wafer_id"].astype(str)
-        case_df["good_bad_norm"] = _normalize_good_bad(case_df["good_bad"])
 
         ax.axhspan(0.5, 1.35, color="#fee2e2", alpha=0.25, zorder=0)
         ax.axhspan(-0.35, 0.5, color="#dbeafe", alpha=0.18, zorder=0)
@@ -587,12 +711,12 @@ def plot_ranked_cases(
         ax.axhline(1, color="#94a3b8", linewidth=0.8, zorder=1)
 
         for state, style in state_style.items():
-            subset = case_df[case_df["good_bad_norm"] == state]
-            if subset.empty:
+            subset = case_df.filter(pl.col("_good_bad_norm") == state)
+            if subset.is_empty():
                 continue
             ax.scatter(
-                subset["x_pos"],
-                subset["y"].astype(int),
+                subset.get_column("x_pos").to_numpy(),
+                subset.get_column("y").cast(pl.Int64).to_numpy(),
                 s=70,
                 c=style["color"],
                 marker=style["marker"],
@@ -602,15 +726,23 @@ def plot_ranked_cases(
                 zorder=3,
             )
 
-        ax.set_xlim(0.4, len(case_df) + 0.6)
+        x_positions = case_df.get_column("x_pos").to_numpy()
+        ax.set_xlim(0.4, case_df.height + 0.6)
         ax.set_ylim(-0.35, 1.35)
         ax.set_yticks([0, 1])
         ax.set_ylabel("y")
-        ax.set_xticks(case_df["x_pos"])
-        ax.set_xticklabels(case_df["wafer_key"], rotation=90, fontsize=6)
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(
+            case_df.get_column("wafer_key").to_list(),
+            rotation=90,
+            fontsize=6,
+        )
         ax.grid(axis="x", color="#e5e7eb", linewidth=0.5)
         lot_end_positions = (
-            case_df.groupby("root_lot_id", sort=False)["x_pos"].max().to_numpy()
+            case_df.group_by("root_lot_id", maintain_order=True)
+            .agg(pl.col("x_pos").max())
+            .get_column("x_pos")
+            .to_numpy()
         )
         for lot_end in lot_end_positions[:-1]:
             ax.axvline(lot_end + 0.5, color="#64748b", linewidth=1.2, zorder=2)
@@ -637,8 +769,8 @@ def plot_ranked_cases(
     return fig
 
 
-def make_simulation_dataframe() -> pd.DataFrame:
-    """Build the requested wafer-level simulation cases."""
+def make_simulation_dataframe() -> pl.DataFrame:
+    """Build the requested wafer-level simulation cases as Polars."""
     cases = [
         make_case("lot_perfect_N25", n_B1=5, n_B0=0, n_G1=0, n_G0=20),
         make_case("tiny_perfect_N2", n_B1=1, n_B0=0, n_G1=0, n_G0=1),
@@ -646,17 +778,23 @@ def make_simulation_dataframe() -> pd.DataFrame:
         make_case("all_y1_N25", n_B1=5, n_B0=0, n_G1=20, n_G0=0),
         make_case("all_y0_N25", n_B1=0, n_B0=5, n_G1=0, n_G0=20),
         make_case("bad_missed_N25", n_B1=1, n_B0=4, n_G1=0, n_G0=20),
-        make_case("noisy_good_in_y1_N25", n_B1=5, n_B0=0, n_G1=8, n_G0=12),
+        make_case(
+            "noisy_good_in_y1_N25",
+            n_B1=5,
+            n_B0=0,
+            n_G1=8,
+            n_G0=12,
+        ),
         make_case("random_mix_N25", n_B1=2, n_B0=3, n_G1=4, n_G0=16),
         make_case("medium_perfect_N10", n_B1=2, n_B0=0, n_G1=0, n_G0=8),
         make_case("no_bad_N25", n_B1=0, n_B0=0, n_G1=0, n_G0=25),
         make_case("no_good_N5", n_B1=5, n_B0=0, n_G1=0, n_G0=0),
     ]
-    return pd.concat(cases, ignore_index=True)
+    return pl.concat(cases, how="vertical")
 
 
-def make_multi_lot_simulation_dataframe() -> pd.DataFrame:
-    """Build four simulation cases, each pooled from three root lots."""
+def make_multi_lot_simulation_dataframe() -> pl.DataFrame:
+    """Build four Polars simulation cases, each pooled from three root lots."""
     case_specs = {
         "three_lot_perfect": {
             "LOT_A": (2, 0, 0, 6),
@@ -680,7 +818,7 @@ def make_multi_lot_simulation_dataframe() -> pd.DataFrame:
         },
     }
 
-    frames: List[pd.DataFrame] = []
+    frames: List[pl.DataFrame] = []
     for step_seq, lot_specs in case_specs.items():
         for root_lot_id, counts in lot_specs.items():
             frames.append(
@@ -693,49 +831,57 @@ def make_multi_lot_simulation_dataframe() -> pd.DataFrame:
                     root_lot_id=root_lot_id,
                 )
             )
-    return pd.concat(frames, ignore_index=True)
+    return pl.concat(frames, how="vertical")
 
 
-def _run_multi_lot_sanity_checks(result_df: pd.DataFrame) -> None:
+def _run_multi_lot_sanity_checks(result_df: pl.DataFrame) -> None:
     """Verify that every case pools three lots and preserves expected ranking."""
-    by_id = result_df.set_index("step_seq")
-    assert (by_id["root_lot_count"] == 3).all()
-    assert (by_id["input_rows"] == 24).all()
+    by_id = _result_rows_by_step(result_df)
+    assert all(row["root_lot_count"] == 3 for row in by_id.values())
+    assert all(row["input_rows"] == 24 for row in by_id.values())
     assert all(
-        lot_ids == ["LOT_A", "LOT_B", "LOT_C"]
-        for lot_ids in by_id["root_lot_ids"]
+        row["root_lot_ids"] == ["LOT_A", "LOT_B", "LOT_C"]
+        for row in by_id.values()
     )
 
-    score = by_id["score"]
-    assert score["three_lot_perfect"] > score["three_lot_good_noise"]
-    assert score["three_lot_perfect"] > score["three_lot_bad_missed"]
-    assert score["three_lot_perfect"] > score["three_lot_random_mix"]
+    assert (
+        by_id["three_lot_perfect"]["score"]
+        > by_id["three_lot_good_noise"]["score"]
+    )
+    assert (
+        by_id["three_lot_perfect"]["score"]
+        > by_id["three_lot_bad_missed"]["score"]
+    )
+    assert (
+        by_id["three_lot_perfect"]["score"]
+        > by_id["three_lot_random_mix"]["score"]
+    )
 
 
 def run_simulation_cases(
     params: Optional[ScoreParams] = None,
     plot_path: Optional[str | Path] = None,
-) -> pd.DataFrame:
-    """Build the requested simulation cases, print key columns, and return all results."""
+) -> pl.DataFrame:
+    """Build, print, and return Polars simulation results."""
     params = params or ScoreParams()
     df = make_simulation_dataframe()
     result_df = score_process_dataframe(df, params=params)
     _run_sanity_checks(result_df)
 
-    with pd.option_context(
-        "display.max_rows",
-        None,
-        "display.max_columns",
-        None,
-        "display.width",
-        180,
-        "display.float_format",
-        "{:.6g}".format,
+    with pl.Config(
+        tbl_rows=-1,
+        tbl_cols=-1,
+        float_precision=6,
     ):
-        print(result_df[DISPLAY_COLUMNS].to_string(index=False))
+        print(result_df.select(DISPLAY_COLUMNS))
     print("\nSanity checks passed.")
     if plot_path is not None:
-        plot_ranked_cases(df=df, result_df=result_df, output_path=plot_path, close=True)
+        plot_ranked_cases(
+            df=df,
+            result_df=result_df,
+            output_path=plot_path,
+            close=True,
+        )
         print(f"Ranked wafer-context plot saved to: {plot_path}")
     return result_df
 
