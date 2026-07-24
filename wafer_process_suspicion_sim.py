@@ -29,6 +29,9 @@ class ScoreParams:
 
 DISPLAY_COLUMNS = [
     "step_seq",
+    "root_lot_count",
+    "root_lot_ids",
+    "input_rows",
     "N_real",
     "n_B_real",
     "n_G_real",
@@ -55,7 +58,8 @@ SINGLE_STEP_LOT_REQUIRED_COLUMNS = {"root_lot_id", "wafer_id", "good_bad", "y"}
 
 SINGLE_STEP_LOT_OUTPUT_COLUMNS = [
     "step_seq",
-    "root_lot_id",
+    "root_lot_count",
+    "root_lot_ids",
     "input_rows",
     "N_real",
     "N_eff",
@@ -293,6 +297,36 @@ def _invalid_y_mask(series: pd.Series) -> pd.Series:
     return y.isna() | ((y % 1) != 0) | ~y.isin([0, 1])
 
 
+def _ordered_root_lot_ids(df: pd.DataFrame) -> List[str]:
+    """Return distinct root lot IDs in their first-seen order."""
+    return [str(value) for value in pd.unique(df["root_lot_id"])]
+
+
+def _validate_wafer_identity_rows(
+    df: pd.DataFrame,
+    identity_columns: List[str],
+    max_wafers: int,
+) -> None:
+    """Validate per-lot wafer IDs and reject duplicate wafer identities."""
+    if max_wafers < 1:
+        raise ValueError("max_wafers must be at least 1.")
+
+    wafer_ids = pd.to_numeric(df["wafer_id"], errors="coerce")
+    if wafer_ids.isna().any():
+        invalid = sorted(set(df.loc[wafer_ids.isna(), "wafer_id"].astype(str)))
+        raise ValueError(f"wafer_id must be numeric values from 1 to {max_wafers}: {invalid}")
+    if ((wafer_ids % 1) != 0).any():
+        raise ValueError("wafer_id must be integer-valued.")
+    invalid_range = (wafer_ids < 1) | (wafer_ids > max_wafers)
+    if invalid_range.any():
+        invalid = sorted(set(df.loc[invalid_range, "wafer_id"].astype(str)))
+        raise ValueError(f"wafer_id must be in 1..{max_wafers} within each root lot: {invalid}")
+
+    if df.duplicated(identity_columns).any():
+        duplicated = df.loc[df.duplicated(identity_columns, keep=False), identity_columns]
+        raise ValueError(f"Duplicate wafer identity rows found: {duplicated.to_dict('records')}")
+
+
 def _to_pandas_dataframe(data: Any) -> pd.DataFrame:
     """Return a pandas DataFrame from pandas or polars DataFrame-like input."""
     if isinstance(data, pd.DataFrame):
@@ -310,7 +344,7 @@ def _to_pandas_dataframe(data: Any) -> pd.DataFrame:
     raise TypeError("Input must be a pandas DataFrame or a polars DataFrame/LazyFrame.")
 
 
-def _validate_input_dataframe(df: pd.DataFrame) -> None:
+def _validate_input_dataframe(df: pd.DataFrame, max_wafers: int = 25) -> None:
     required = {"step_seq", "root_lot_id", "wafer_id", "good_bad", "y"}
     missing = required - set(df.columns)
     if missing:
@@ -320,6 +354,12 @@ def _validate_input_dataframe(df: pd.DataFrame) -> None:
         if df[column].isna().any():
             raise ValueError(f"{column} must not contain missing values.")
 
+    _validate_wafer_identity_rows(
+        df,
+        identity_columns=["step_seq", "root_lot_id", "wafer_id"],
+        max_wafers=max_wafers,
+    )
+
     good_bad = _normalize_good_bad(df["good_bad"])
     invalid_good_bad = sorted(set(df.loc[good_bad.isna(), "good_bad"].astype(str)))
     if invalid_good_bad:
@@ -331,35 +371,21 @@ def _validate_input_dataframe(df: pd.DataFrame) -> None:
         raise ValueError(f"Invalid y values: {invalid}")
 
 
-def _validate_single_step_lot_dataframe(df: pd.DataFrame, max_wafers: int) -> str:
+def _validate_single_step_lot_dataframe(df: pd.DataFrame, max_wafers: int) -> List[str]:
     missing = SINGLE_STEP_LOT_REQUIRED_COLUMNS - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
     if df.empty:
         raise ValueError("Input DataFrame must contain at least one wafer row.")
-    if len(df) > max_wafers:
-        raise ValueError(f"Expected at most {max_wafers} wafer rows, got {len(df)}.")
 
     if df["root_lot_id"].isna().any():
         raise ValueError("root_lot_id must not contain missing values.")
-    root_lot_ids = df["root_lot_id"].unique()
-    if len(root_lot_ids) != 1:
-        raise ValueError(f"Expected exactly one root_lot_id, got {list(root_lot_ids)}.")
-    root_lot_id = root_lot_ids[0]
-
-    wafer_ids = pd.to_numeric(df["wafer_id"], errors="coerce")
-    if wafer_ids.isna().any():
-        invalid = sorted(set(df.loc[wafer_ids.isna(), "wafer_id"].astype(str)))
-        raise ValueError(f"wafer_id must be numeric values from 1 to {max_wafers}: {invalid}")
-    if ((wafer_ids % 1) != 0).any():
-        raise ValueError("wafer_id must be integer-valued.")
-    if ((wafer_ids < 1) | (wafer_ids > max_wafers)).any():
-        invalid = sorted(set(df.loc[(wafer_ids < 1) | (wafer_ids > max_wafers), "wafer_id"].astype(str)))
-        raise ValueError(f"wafer_id must be in 1..{max_wafers}: {invalid}")
-
-    if df.duplicated(["root_lot_id", "wafer_id"]).any():
-        duplicated = df.loc[df.duplicated(["root_lot_id", "wafer_id"], keep=False), ["root_lot_id", "wafer_id"]]
-        raise ValueError(f"Duplicate wafer identity rows found: {duplicated.to_dict('records')}")
+    root_lot_ids = _ordered_root_lot_ids(df)
+    _validate_wafer_identity_rows(
+        df,
+        identity_columns=["root_lot_id", "wafer_id"],
+        max_wafers=max_wafers,
+    )
 
     good_bad = _normalize_good_bad(df["good_bad"])
     invalid_good_bad = sorted(set(df.loc[good_bad.isna(), "good_bad"].astype(str)))
@@ -371,7 +397,7 @@ def _validate_single_step_lot_dataframe(df: pd.DataFrame, max_wafers: int) -> st
         invalid = sorted(set(df.loc[invalid_y, "y"].astype(str)))
         raise ValueError(f"Invalid y values: {invalid}")
 
-    return str(root_lot_id)
+    return root_lot_ids
 
 
 def score_single_step_lot_dataframe(
@@ -382,16 +408,18 @@ def score_single_step_lot_dataframe(
     max_wafers: int = 25,
 ) -> Dict[str, Any] | pd.DataFrame:
     """
-    Score one user-provided step/root-lot wafer table.
+    Score one user-provided step containing one or more root lots.
 
     Required input columns are root_lot_id, wafer_id, good_bad, and y. The input
     may be a pandas DataFrame or a polars DataFrame/LazyFrame. If a step_seq
     column is present it must contain exactly one value; otherwise step_seq can
-    be supplied as an argument and defaults to "input_step".
+    be supplied as an argument and defaults to "input_step". All input lots are
+    pooled into one count table and scored once for that step. max_wafers limits
+    wafer_id within each root lot; it does not limit the number of input lots.
     """
     params = params or ScoreParams()
     df = _to_pandas_dataframe(data)
-    root_lot_id = _validate_single_step_lot_dataframe(df, max_wafers=max_wafers)
+    root_lot_ids = _validate_single_step_lot_dataframe(df, max_wafers=max_wafers)
 
     if "step_seq" in df.columns:
         if df["step_seq"].isna().any():
@@ -416,7 +444,9 @@ def score_single_step_lot_dataframe(
         params=params,
     )
     result["step_seq"] = step_seq
-    result["root_lot_id"] = root_lot_id
+    result["root_lot_id"] = root_lot_ids[0] if len(root_lot_ids) == 1 else None
+    result["root_lot_count"] = len(root_lot_ids)
+    result["root_lot_ids"] = root_lot_ids
     result["input_rows"] = int(len(df))
 
     if as_dataframe:
@@ -424,9 +454,10 @@ def score_single_step_lot_dataframe(
     return result
 
 
-def score_process_dataframe(df: pd.DataFrame, params: Optional[ScoreParams] = None) -> pd.DataFrame:
-    """Score all step_seq groups in a wafer-level DataFrame."""
+def score_process_dataframe(data: Any, params: Optional[ScoreParams] = None) -> pd.DataFrame:
+    """Pool all lots within each step_seq and score every step once."""
     params = params or ScoreParams()
+    df = _to_pandas_dataframe(data)
     _validate_input_dataframe(df)
 
     rows: List[Dict[str, Any]] = []
@@ -441,6 +472,9 @@ def score_process_dataframe(df: pd.DataFrame, params: Optional[ScoreParams] = No
             params=params,
         )
         result["step_seq"] = step_seq
+        result["root_lot_count"] = int(group["root_lot_id"].nunique())
+        result["root_lot_ids"] = _ordered_root_lot_ids(group)
+        result["input_rows"] = int(len(group))
         rows.append(result)
 
     if not rows:
